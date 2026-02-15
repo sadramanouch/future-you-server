@@ -192,10 +192,11 @@ function run(sql, params = []) {
 }
 
 // Middleware
-const allowedOrigins = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',')
+const rawOrigins = process.env.ALLOWED_ORIGINS || '';
+const corsOrigin = rawOrigins === '*' ? true : rawOrigins
+  ? rawOrigins.split(',')
   : ['http://localhost:8085', 'http://localhost:19006', 'http://localhost:8081'];
-app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(helmet());
 
 // Rate limiter for auth endpoints (5 attempts per 15 minutes per IP)
