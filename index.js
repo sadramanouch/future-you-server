@@ -5,6 +5,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -14,12 +16,20 @@ const path = require('path');
 require('dotenv').config();
 const Stripe = require('stripe');
 const { generateEmbedding, cosineSimilarity } = require('./embeddings');
+const sharp = require('sharp');
 
 const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'future-you-secret-key-change-in-production';
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'futureyou.db');
+// In production (Railway), use RAILWAY_VOLUME_MOUNT_PATH for persistent storage
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'futureyou.db');
+
+// Claude API Configuration (key stays server-side only)
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_VERSION = '2023-06-01';
+const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 
 let db = null;
 
@@ -121,6 +131,14 @@ async function initDatabase() {
     )
   `);
 
+  // Add photo columns to profiles if not present
+  try {
+    db.run('ALTER TABLE profiles ADD COLUMN profile_photo TEXT');
+  } catch (e) { /* column already exists */ }
+  try {
+    db.run('ALTER TABLE profiles ADD COLUMN aged_photo TEXT');
+  } catch (e) { /* column already exists */ }
+
   // Seed default promo code
   const existingPromo = getOne('SELECT id FROM promo_codes WHERE code = ?', ['FUTUREYOU100']);
   if (!existingPromo) {
@@ -178,6 +196,27 @@ const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',')
   : ['http://localhost:8085', 'http://localhost:19006', 'http://localhost:8081'];
 app.use(cors({ origin: allowedOrigins, credentials: true }));
+app.use(helmet());
+
+// Rate limiter for auth endpoints (5 attempts per 15 minutes per IP)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+});
+
+// General API rate limiter (100 requests per minute per IP)
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  message: { error: 'Too many requests. Please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/api/', generalLimiter);
 
 // Stripe webhook MUST be before JSON parser (needs raw body for signature verification)
 app.post('/api/payment/webhook', express.raw({ type: 'application/json' }), (req, res) => {
@@ -272,15 +311,126 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+// ============= AI RATE LIMITER =============
+
+const aiRateLimits = new Map();
+const AI_RATE_LIMIT = 60;
+const AI_RATE_WINDOW_MS = 60 * 1000;
+
+const aiRateLimiter = (req, res, next) => {
+  const userId = req.user.userId;
+  const now = Date.now();
+  const userLimit = aiRateLimits.get(userId);
+
+  if (!userLimit || now - userLimit.windowStart > AI_RATE_WINDOW_MS) {
+    aiRateLimits.set(userId, { count: 1, windowStart: now });
+    return next();
+  }
+
+  if (userLimit.count >= AI_RATE_LIMIT) {
+    return res.status(429).json({ error: 'Rate limit exceeded. Please wait before making more requests.' });
+  }
+
+  userLimit.count++;
+  return next();
+};
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of aiRateLimits) {
+    if (now - val.windowStart > AI_RATE_WINDOW_MS * 2) aiRateLimits.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+// ============= CLAUDE API HELPER =============
+
+async function callClaudeAPI({ model, max_tokens, system, messages, temperature }) {
+  if (!CLAUDE_API_KEY) {
+    throw Object.assign(new Error('CLAUDE_API_KEY not configured on server'), { status: 500 });
+  }
+
+  const body = { model, max_tokens, messages };
+  if (system) body.system = system;
+  if (temperature !== undefined) body.temperature = temperature;
+
+  const response = await fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': CLAUDE_API_KEY,
+      'anthropic-version': ANTHROPIC_VERSION,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    let errorMessage;
+    try {
+      const errorData = JSON.parse(errorText);
+      errorMessage = errorData.error?.message || errorData.message || errorText;
+    } catch {
+      errorMessage = errorText || `HTTP ${response.status}`;
+    }
+    throw Object.assign(new Error(errorMessage), { status: response.status });
+  }
+
+  return response.json();
+}
+
+// ============= AI REQUEST VALIDATION =============
+
+const MAX_SYSTEM_PROMPT_LENGTH = 50000;
+const MAX_MESSAGE_CONTENT_LENGTH = 10000;
+const MAX_MESSAGES_COUNT = 100;
+
+function validateAIRequest(systemPrompt, messages) {
+  if (systemPrompt && typeof systemPrompt !== 'string') {
+    return 'System prompt must be a string';
+  }
+  if (systemPrompt && systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH) {
+    return 'System prompt exceeds maximum length';
+  }
+  if (!Array.isArray(messages)) {
+    return 'Messages must be an array';
+  }
+  if (messages.length > MAX_MESSAGES_COUNT) {
+    return 'Too many messages';
+  }
+  for (const msg of messages) {
+    if (!msg.role || !msg.content) return 'Each message must have role and content';
+    if (typeof msg.content !== 'string') return 'Message content must be a string';
+    if (msg.content.length > MAX_MESSAGE_CONTENT_LENGTH) return 'Message content exceeds maximum length';
+    if (!['user', 'assistant'].includes(msg.role)) return 'Invalid message role';
+  }
+  return null;
+}
+
 // ============= AUTH ROUTES =============
 
 // Sign up
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', authLimiter, async (req, res) => {
   try {
     const { email, password, name, phone } = req.body;
 
     if (!email || !password || !name) {
       return res.status(400).json({ error: 'Email, password, and name are required' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password strength
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
+    // Validate name
+    if (name.length < 1 || name.length > 100) {
+      return res.status(400).json({ error: 'Name must be between 1 and 100 characters' });
     }
 
     // Check if user already exists
@@ -290,7 +440,7 @@ app.post('/api/auth/signup', async (req, res) => {
     }
 
     // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12);
 
     // Create user
     const userId = uuidv4();
@@ -300,8 +450,8 @@ app.post('/api/auth/signup', async (req, res) => {
       [userId, email.toLowerCase(), hashedPassword, name, phone || null, now, now]
     );
 
-    // Generate token
-    const token = jwt.sign({ userId, email: email.toLowerCase() }, JWT_SECRET, { expiresIn: '30d' });
+    // Generate token (7 day expiry)
+    const token = jwt.sign({ userId, email: email.toLowerCase() }, JWT_SECRET, { expiresIn: '7d' });
 
     res.status(201).json({
       message: 'Account created successfully',
@@ -315,7 +465,7 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 // Login
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -335,8 +485,8 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // Generate token
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    // Generate token (7 day expiry)
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
 
     // Get profile if exists
     const profile = getOne('SELECT future_self_data FROM profiles WHERE user_id = ?', [user.id]);
@@ -737,6 +887,265 @@ app.post('/api/memory/retrieve', authenticateToken, async (req, res) => {
   }
 });
 
+// List all memories for user, grouped by date
+app.get('/api/memory/all', authenticateToken, (req, res) => {
+  try {
+    const userId = req.user.userId;
+
+    // Clean expired nuggets
+    const now = new Date().toISOString();
+    run('DELETE FROM memory_nuggets WHERE expires_at < ? AND user_id = ?', [now, userId]);
+
+    const nuggets = getAll(
+      'SELECT content, session_date, created_at FROM memory_nuggets WHERE user_id = ? ORDER BY created_at DESC',
+      [userId]
+    );
+
+    // Group by session_date
+    const grouped = {};
+    for (const n of nuggets) {
+      const date = n.session_date;
+      if (!grouped[date]) grouped[date] = [];
+      grouped[date].push({ content: n.content, createdAt: n.created_at });
+    }
+
+    // Convert to sorted array
+    const days = Object.entries(grouped)
+      .map(([date, memories]) => ({ date, memories }))
+      .sort((a, b) => b.date.localeCompare(a.date));
+
+    res.json({ days, totalMemories: nuggets.length });
+  } catch (error) {
+    console.error('Memory list error:', error);
+    res.status(500).json({ error: 'Failed to list memories' });
+  }
+});
+
+// ============= AI PROXY ROUTES =============
+
+// Proxy: send conversation message
+app.post('/api/ai/message', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { systemPrompt, messages, model, maxTokens } = req.body;
+
+    const validationError = validateAIRequest(systemPrompt, messages);
+    if (validationError) {
+      return res.status(400).json({ error: validationError });
+    }
+
+    const data = await callClaudeAPI({
+      model: model || 'claude-sonnet-4-20250514',
+      max_tokens: Math.min(maxTokens || 150, 4096),
+      system: systemPrompt,
+      messages,
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    res.json({ response: textContent?.text || '' });
+  } catch (error) {
+    console.error('AI message error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to get AI response' });
+  }
+});
+
+// Proxy: generate opening message
+app.post('/api/ai/opening-message', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const data = await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    res.json({ response: textContent?.text || '' });
+  } catch (error) {
+    console.error('AI opening-message error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to generate opening message' });
+  }
+});
+
+// Proxy: generate reflection
+app.post('/api/ai/reflection', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const data = await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    res.json({ response: textContent?.text || '{}' });
+  } catch (error) {
+    console.error('AI reflection error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to generate reflection' });
+  }
+});
+
+// Proxy: generate weekly digest
+app.post('/api/ai/weekly-digest', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const data = await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    res.json({ response: textContent?.text || '{}' });
+  } catch (error) {
+    console.error('AI weekly-digest error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to generate weekly digest' });
+  }
+});
+
+// Proxy: generate daily challenge
+app.post('/api/ai/daily-challenge', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const data = await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 60,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    res.json({ response: textContent?.text?.trim() || '' });
+  } catch (error) {
+    console.error('AI daily-challenge error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to generate daily challenge' });
+  }
+});
+
+// Proxy: extract memory nuggets
+app.post('/api/ai/memory-nuggets', authenticateToken, aiRateLimiter, async (req, res) => {
+  try {
+    const { prompt } = req.body;
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required' });
+    }
+
+    const data = await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 200,
+      temperature: 0,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const textContent = data.content?.find(c => c.type === 'text');
+    let nuggets = [];
+    try {
+      nuggets = JSON.parse(textContent?.text || '[]');
+    } catch { /* return empty on parse failure */ }
+
+    res.json({ nuggets: Array.isArray(nuggets) ? nuggets : [] });
+  } catch (error) {
+    console.error('AI memory-nuggets error:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to extract memory nuggets' });
+  }
+});
+
+// Proxy: test AI connection
+app.post('/api/ai/test', authenticateToken, async (req, res) => {
+  try {
+    await callClaudeAPI({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+    res.json({ connected: true });
+  } catch (error) {
+    res.json({ connected: false, error: error.message });
+  }
+});
+
+// ============================================================
+// PHOTO AGING ENDPOINT (sharp - free, no API key needed)
+// ============================================================
+
+app.post('/api/ai/age-photo', authenticateToken, async (req, res) => {
+  const { photo, currentAge, targetAge } = req.body;
+  const userId = req.user.userId;
+
+  if (!photo || !currentAge || !targetAge) {
+    return res.status(400).json({ error: 'photo (base64), currentAge, and targetAge are required' });
+  }
+
+  // One-time aging per user — check if already done
+  const profile = getOne('SELECT aged_photo FROM profiles WHERE user_id = ?', [userId]);
+  if (profile && profile.aged_photo) {
+    return res.status(409).json({ error: 'Photo already aged. Upload a custom photo instead.' });
+  }
+
+  try {
+    const inputBuffer = Buffer.from(photo, 'base64');
+    const ageDiff = targetAge - currentAge;
+
+    // Scale the aging effect based on how far into the future
+    // More years = stronger effect
+    const intensity = Math.min(ageDiff / 30, 1); // 0-1 scale, maxes at 30 years
+
+    // Apply aging transformations with sharp:
+    // 1. Warm color shift (golden/amber tone — like aged photographs)
+    // 2. Slight desaturation (colors fade with age)
+    // 3. Subtle softening (skin texture smoothing)
+    // 4. Slight brightness/contrast adjustment
+    const agedBuffer = await sharp(inputBuffer)
+      .modulate({
+        brightness: 1 + (intensity * 0.05),    // Slightly brighter
+        saturation: 1 - (intensity * 0.2),     // Reduce saturation 0-20%
+        hue: Math.round(intensity * 15),        // Warm shift toward golden
+      })
+      .gamma(1 + (intensity * 0.15))            // Subtle gamma lift (softer look)
+      .sharpen({ sigma: 0.5 + intensity })      // Light sharpening to offset softness
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    const agedBase64 = agedBuffer.toString('base64');
+
+    // Store both photos in the profile
+    if (profile) {
+      run('UPDATE profiles SET profile_photo = ?, aged_photo = ?, updated_at = ? WHERE user_id = ?',
+        [photo.substring(0, 200000), agedBase64.substring(0, 200000), new Date().toISOString(), userId]);
+      saveDatabase();
+    }
+
+    res.json({ agedPhoto: agedBase64 });
+  } catch (error) {
+    console.error('Photo aging error:', error.message);
+    res.status(500).json({ error: 'Failed to process photo.' });
+  }
+});
+
+// Get aged photo (for loading on app restart)
+app.get('/api/ai/aged-photo', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  const profile = getOne('SELECT aged_photo, profile_photo FROM profiles WHERE user_id = ?', [userId]);
+  if (!profile || !profile.aged_photo) {
+    return res.json({ agedPhoto: null, profilePhoto: null });
+  }
+  res.json({ agedPhoto: profile.aged_photo, profilePhoto: profile.profile_photo });
+});
+
 // Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -744,7 +1153,7 @@ app.get('/api/health', (req, res) => {
 
 // Initialize and start server
 initDatabase().then(() => {
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`Future You server running on port ${PORT}`);
     console.log(`Health check: http://localhost:${PORT}/api/health`);
   });
