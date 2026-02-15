@@ -22,8 +22,8 @@ const app = express();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'future-you-secret-key-change-in-production';
-// In production (Railway), use RAILWAY_VOLUME_MOUNT_PATH for persistent storage
-const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+// In production, use DATA_DIR env var for persistent volume storage
+const DATA_DIR = process.env.DATA_DIR || __dirname;
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'futureyou.db');
 
 // Claude API Configuration (key stays server-side only)
